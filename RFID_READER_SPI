@@ -1,0 +1,86 @@
+#include <SPI.h>
+#include <Adafruit_PN532.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+#define PN532_SS   (15)
+#define PN532_MOSI (23)
+#define PN532_MISO (22)
+#define PN532_SCK  (18)
+
+Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
+
+// ESP'S MAC ADDRESS
+uint8_t broadcastAddress[] = {0x28, 0x05, 0xA5, 0x24, 0xD6, 0x60}; 
+
+typedef struct struct_message {
+  uint8_t uid[7];
+  uint8_t len;
+} struct_message;
+
+struct_message myData;
+esp_now_peer_info_t peerInfo;
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Register peer
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  // Initialize PN532
+  nfc.begin();
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    Serial.print("Didn't find PN53x board. Check wiring and DIP switches!");
+    while (1); 
+  }
+  
+  Serial.print("Found chip PN5"); Serial.println((versiondata>>24) & 0xFF, HEX);
+  
+  // Configure board to read RFID tags
+  nfc.SAMConfig();
+  Serial.println("Waiting for an RFID Tag...");
+}
+
+void loop() {
+  uint8_t success;
+  uint8_t uidLength;
+
+  success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, myData.uid, &uidLength);
+
+  if (success) {
+    myData.len = uidLength;
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+    
+    Serial.print("Tag UID: ");
+    for (uint8_t i = 0; i < uidLength; i++) {
+      Serial.print(myData.uid[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+    
+    if (result == ESP_OK) {
+      Serial.println("Sent via ESP-NOW successfully");
+    } else {
+      Serial.println("Error sending via ESP-NOW");
+    }
+    
+    delay(2000);
+  }
+}
+
+
+
