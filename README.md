@@ -1,0 +1,4 @@
+Small Overview
+This repository contains the firmware and logic for the Pacman Robotic Platform, a modular, dual-microcontroller embedded system designed for grid-based autonomous navigation. The project utilizes a distributed computing architecture to separate high-frequency motor control from real-time sensor acquisition and visual feedback.
+
+The system is built around two ESP32-S microcontrollers communicating via the ESP-NOW protocol. This "Observer-Executor" model allows for a holonomic drive system that remains responsive even while processing complex multi-protocol sensor data from an RFID-mapped environment.
