@@ -1,0 +1,200 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Adafruit_NeoPixel.h>
+
+#define LED_PIN 5
+#define LED_COUNT 24 
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// State: 0 = Red, 1 = Off (Player), 2 = Blue (Hunter)
+uint8_t tagState[LED_COUNT] = {0}; 
+bool gameWon = false;
+bool gameOver = false;
+
+int playerPos = -1;
+int hunterPos = -1;
+
+// receiving data from Rfid readers
+uint8_t macA[] = {0xB4, 0xBF, 0xE9, 0x0B, 0x54, 0xC0};
+uint8_t macB[] = {0xE0, 0x8C, 0xFE, 0x34, 0x53, 0x20};
+
+// sending data for movements
+uint8_t hunterRFID_Mac[] = {0xB4, 0xBF, 0xE9, 0x0A, 0x3A, 0x0C};
+uint8_t playerRFID_Mac[] = {0xE0, 0x8C, 0xFE, 0x32, 0xB3, 0x58};
+
+constexpr uint8_t WIFI_CHANNEL = 1;
+enum RobotCommand : uint8_t { CMD_STOP = 0, CMD_FORWARD, CMD_BACKWARD, CMD_LEFT, CMD_RIGHT };
+struct __attribute__((packed)) ControlPacket {
+  uint8_t command; uint8_t speed; uint16_t sequence;
+};
+
+// simplified version of tag ids
+const uint8_t TAG_PREFIX[] = {0x04, 0x61};
+const uint8_t TAG_SUFFIX[] = {0x02, 0x6C, 0x21, 0x90};
+
+bool isAdjacent(int pos1, int pos2) {
+  if (pos1 < 0 || pos2 < 0) return false;
+  int x1 = pos1 % 4, y1 = pos1 / 4;
+  int x2 = pos2 % 4, y2 = pos2 / 4;
+  int dist = abs(x1 - x2) + abs(y1 - y2);
+  return (dist == 1); // One tag away (Up, Down, Left, or Right)
+}
+
+void checkWinCondition() {
+  if (gameWon || gameOver) return;
+  for (int i = 0; i < LED_COUNT; i++) {
+    if (tagState[i] == 0) return; 
+  }
+  gameWon = true;
+}
+
+void playWinAnimation() {
+  uint32_t colors[] = {
+    strip.Color(255, 0, 0),     // red
+    strip.Color(0, 255, 0),     // green
+    strip.Color(0, 0, 255),     // blue
+    strip.Color(255, 255, 0),   // yellow
+    strip.Color(255, 0, 255)    // magenta
+  };
+
+  int snakeLength = 5;
+  int totalSteps = LED_COUNT + snakeLength;
+
+  // repeat animation a few times for "winning" effect
+  for (int repeat = 0; repeat < 1; repeat++) {
+
+    for (int step = 0; step < totalSteps; step++) {
+      strip.clear();
+
+      for (int i = 0; i < snakeLength; i++) {
+        int pos = step - i;
+
+        if (pos >= 0 && pos < LED_COUNT) {
+          uint32_t color = colors[(pos + i) % 5];
+          strip.setPixelColor(pos, color);
+        }
+      }
+
+      strip.show();
+      delay(40); // speed (lower = faster)
+    }
+  }
+ for (int flash = 0; flash < 10; flash++) {
+    for (int i = 0; i < LED_COUNT; i++) {
+      strip.setPixelColor(i, colors[i % 5]); 
+    }
+    strip.show();
+    delay(100);
+
+    strip.clear();
+    strip.show();
+    delay(100);
+  }
+}
+
+
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingRaw, int len) {
+  if (len < 7 || gameWon || gameOver) return;
+  if (memcmp(incomingRaw, TAG_PREFIX, 2) != 0 || memcmp(incomingRaw + 3, TAG_SUFFIX, 4) != 0) return;
+
+  uint8_t uniqueByte = incomingRaw[2];
+  int index = -1;
+  if (uniqueByte >= 0x44 && uniqueByte <= 0x5C) {
+    if (uniqueByte < 0x4F) index = uniqueByte - 0x44;
+    else if (uniqueByte > 0x4F) index = uniqueByte - 0x45;
+  }
+
+  if (index >= 0 && index < LED_COUNT) {
+    if (memcmp(info->src_addr, hunterRFID_Mac, 6) == 0) {
+      tagState[index] = 2;
+      hunterPos = index;
+    } 
+    else if (memcmp(info->src_addr, playerRFID_Mac, 6) == 0) {
+      tagState[index] = 1;
+      playerPos = index;
+    }
+
+    if (isAdjacent(playerPos, hunterPos)) {
+      gameOver = true; // Ghost caught Pacman
+    }
+    checkWinCondition();
+  }
+}
+
+RobotCommand getDirection(int f, int b, int l, int r) {
+  bool _f = digitalRead(f) == LOW;
+  bool _b = digitalRead(b) == LOW;
+  bool _l = digitalRead(l) == LOW;
+  bool _r = digitalRead(r) == LOW;
+  if ((_f + _b + _l + _r) != 1) return CMD_STOP;
+  if (_f) return CMD_FORWARD;
+  if (_b) return CMD_BACKWARD;
+  if (_l) return CMD_LEFT;
+  return CMD_RIGHT;
+}
+
+void sendToPeer(uint8_t* targetMac, RobotCommand cmd, uint16_t &seq) {
+  ControlPacket packet = { (uint8_t)cmd, 200, seq++ };
+  esp_now_send(targetMac, (uint8_t*)&packet, sizeof(packet));
+}
+
+uint16_t seqA = 0, seqB = 0;
+unsigned long lastSendMsA = 0, lastSendMsB = 0;
+RobotCommand lastCmdA = CMD_STOP, lastCmdB = CMD_STOP;
+
+void setup() {
+  Serial.begin(115200);
+  strip.begin(); strip.setBrightness(50); strip.show();
+
+  int buttons[] = {18, 19, 21, 22, 23, 25, 26, 27};
+  for(int p : buttons) pinMode(p, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) return;
+  esp_now_register_recv_cb(OnDataRecv);
+
+  esp_now_peer_info_t peer = {};
+  peer.channel = WIFI_CHANNEL;
+  memcpy(peer.peer_addr, macA, 6); esp_now_add_peer(&peer);
+  memcpy(peer.peer_addr, macB, 6); esp_now_add_peer(&peer);
+}
+
+void loop() {
+  if (gameWon) {
+    playWinAnimation();
+    return; 
+  }
+
+  if (gameOver) {
+    for (int i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, strip.Color(0, 0, 255));
+    strip.show();
+    sendToPeer(macA, CMD_STOP, seqA);
+    sendToPeer(macB, CMD_STOP, seqB);
+    return; 
+  }
+  for (int i = 0; i < LED_COUNT; i++) {
+    if (tagState[i] == 0) strip.setPixelColor(i, strip.Color(255, 0, 0));
+    else if (tagState[i] == 1) strip.setPixelColor(i, 0);
+    else if (tagState[i] == 2) strip.setPixelColor(i, strip.Color(0, 0, 255));
+  }
+  strip.show();
+
+  unsigned long now = millis();
+  
+  RobotCommand cmdA = getDirection(18, 19, 21, 22);
+  if (cmdA != lastCmdA || now - lastSendMsA > 60) {
+    sendToPeer(macA, cmdA, seqA);
+    lastCmdA = cmdA; lastSendMsA = now;
+  }
+  RobotCommand cmdB = getDirection(23, 25, 26, 27);
+  if (cmdB != lastCmdB || now - lastSendMsB > 60) {
+    sendToPeer(macB, cmdB, seqB);
+    lastCmdB = cmdB; lastSendMsB = now;
+  }
+  delay(10);
+}
+
+
+
+
